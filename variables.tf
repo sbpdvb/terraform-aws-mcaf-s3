@@ -66,7 +66,13 @@ variable "logging" {
     target_bucket = null
     target_prefix = "s3_access_logs/"
   }
-  description = "Logging configuration, defaults to logging to the bucket itself"
+  description = "Logging configuration, logging is disabled by default"
+}
+
+variable "logging_source_bucket_arns" {
+  type        = list(string)
+  default     = []
+  description = "Configures which source buckets are allowed to log to this bucket."
 }
 
 variable "object_lock_mode" {
@@ -85,6 +91,12 @@ variable "object_lock_days" {
   type        = number
   default     = null
   description = "The number of days that you want to specify for the default retention period"
+}
+
+variable "object_ownership_type" {
+  type        = string
+  default     = "ObjectWriter"
+  description = "The object ownership type for the objects in S3 Bucket, defaults to Object Writer "
 }
 
 variable "replication_configuration" {
@@ -112,7 +124,7 @@ variable "policy" {
 
 variable "versioning" {
   type        = bool
-  default     = false
+  default     = true
   description = "Versioning is a means of keeping multiple variants of an object in the same bucket"
 }
 

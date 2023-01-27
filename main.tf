@@ -1,16 +1,16 @@
 locals {
-  bucket_key_enabled        = var.kms_key_arn != null ? true : false
-  cors_rule                 = var.cors_rule != null ? { create = true } : {}
-  logging                   = var.logging != null ? { create = true } : {}
-  logging_permissions       = try(var.logging.target_bucket == null, false) ? { create = true } : {}
-  object_lock_configuration = var.object_lock_mode != null ? { create : true } : {}
-  policy                    = var.policy != null ? [var.policy] : null
-  replication_configuration = var.replication_configuration != null ? { create = true } : {}
+  bucket_key_enabled                 = var.kms_key_arn != null ? true : false
+  cors_rule                          = var.cors_rule != null ? { create = true } : {}
+  lifecycle_rules                    = try(jsondecode(var.lifecycle_rule), var.lifecycle_rule)
+  logging                            = try(var.logging.target_bucket != null, false) ? { create = true } : {}
+  logging_permissions                = length(local.logging_permissions_source_buckets) > 0 ? { create = true } : {}
+  logging_permissions_source_buckets = try(var.logging.target_bucket == var.name, false) ? compact(concat(["arn:aws:s3:::${var.name}"], var.logging_source_bucket_arns)) : var.logging_source_bucket_arns
+  object_lock_configuration          = var.object_lock_mode != null ? { create : true } : {}
+  policy                             = var.policy != null ? var.policy : null
+  replication_configuration          = var.replication_configuration != null ? { create = true } : {}
 }
 
-data "aws_iam_policy_document" "bucket_policy" {
-  source_policy_documents = local.policy
-
+data "aws_iam_policy_document" "ssl_policy" {
   statement {
     sid     = "AllowSSLRequestsOnly"
     actions = ["s3:*"]
@@ -29,7 +29,9 @@ data "aws_iam_policy_document" "bucket_policy" {
       identifiers = ["*"]
     }
   }
+}
 
+data "aws_iam_policy_document" "logging_policy" {
   dynamic "statement" {
     for_each = local.logging_permissions
 
@@ -44,20 +46,49 @@ data "aws_iam_policy_document" "bucket_policy" {
         type        = "Service"
         identifiers = ["logging.s3.amazonaws.com"]
       }
+      condition {
+        test     = "ArnLike"
+        variable = "aws:SourceArn"
+        values   = local.logging_permissions_source_buckets
+      }
     }
   }
 }
 
+data "aws_iam_policy_document" "combined" {
+  source_policy_documents = compact([
+    local.policy,
+    data.aws_iam_policy_document.ssl_policy.json,
+    data.aws_iam_policy_document.logging_policy.json
+  ])
+}
+
+#tfsec:ignore:aws-s3-enable-bucket-logging
 resource "aws_s3_bucket" "default" {
+
+  # Checkov doesn't fully support aws provider 4
+  #checkov:skip=CKV_AWS_19:Ensure all data stored in the S3 bucket is securely encrypted at rest
+  #checkov:skip=CKV_AWS_145:Ensure that S3 buckets are encrypted with KMS by default
+  #checkov:skip=CKV_AWS_21:Ensure all data stored in the S3 bucket have versioning enabled
   bucket              = var.name
   force_destroy       = var.force_destroy
   object_lock_enabled = var.object_lock_mode != null ? true : false
-  tags                = var.tags
+
+  tags = var.tags
 }
 
 resource "aws_s3_bucket_acl" "default" {
+  count  = var.object_ownership_type != "BucketOwnerEnforced" ? 1 : 0
   bucket = aws_s3_bucket.default.id
   acl    = var.acl
+}
+
+resource "aws_s3_bucket_ownership_controls" "default" {
+  count  = var.object_ownership_type == "BucketOwnerPreferred" ? 1 : (var.object_ownership_type == "BucketOwnerEnforced" ? 1 : 0)
+  bucket = aws_s3_bucket.default.id
+  rule {
+    object_ownership = var.object_ownership_type
+  }
 }
 
 resource "aws_s3_bucket_cors_configuration" "default" {
@@ -74,67 +105,70 @@ resource "aws_s3_bucket_cors_configuration" "default" {
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "default" {
-  count  = length(var.lifecycle_rule)
+  count = length(local.lifecycle_rules) > 0 ? 1 : 0
+
   bucket = aws_s3_bucket.default.bucket
 
-  rule {
-    id     = try(var.lifecycle_rule[count.index]["id"], null)
-    status = try(var.lifecycle_rule[count.index]["status"], "Enabled")
+  dynamic "rule" {
+    for_each = local.lifecycle_rules
 
-    dynamic "filter" {
-      for_each = try([var.lifecycle_rule[count.index]["prefix"]], {})
+    content {
+      id     = try(rule.value.id, null)
+      status = try(rule.value.status, "Enabled")
 
-      content {
-        prefix = filter.value
+      dynamic "filter" {
+        for_each = try([rule.value.prefix], [])
+
+        content {
+          prefix = try(filter.value, null)
+        }
       }
-    }
 
-    dynamic "abort_incomplete_multipart_upload" {
-      for_each = try([var.lifecycle_rule[count.index]["abort_incomplete_multipart_upload"]], {})
+      dynamic "abort_incomplete_multipart_upload" {
+        for_each = try(flatten([rule.value.abort_incomplete_multipart_upload]), [])
 
-      content {
-        days_after_initiation = lookup(abort_incomplete_multipart_upload.value, "days_after_initiation", null)
+        content {
+          days_after_initiation = try(abort_incomplete_multipart_upload.value.days_after_initiation, null)
+        }
       }
-    }
 
-    dynamic "expiration" {
-      for_each = try([var.lifecycle_rule[count.index]["expiration"]], {})
+      dynamic "expiration" {
+        for_each = try(flatten([rule.value.expiration]), [])
 
-      content {
-        date                         = lookup(expiration.value, "date", null)
-        days                         = lookup(expiration.value, "days", null)
-        expired_object_delete_marker = lookup(expiration.value, "expired_object_delete_marker", null)
+        content {
+          date                         = try(expiration.value.date, null)
+          days                         = try(expiration.value.days, null)
+          expired_object_delete_marker = try(expiration.value.expired_object_delete_marker, null)
+        }
       }
-    }
 
-    // Max 1 block - noncurrent_version_expiration
-    dynamic "noncurrent_version_expiration" {
-      for_each = try([var.lifecycle_rule[count.index]["noncurrent_version_expiration"]], {})
+      dynamic "noncurrent_version_expiration" {
+        for_each = try(flatten([rule.value.noncurrent_version_expiration]), [])
 
-      content {
-        newer_noncurrent_versions = lookup(noncurrent_version_expiration.value, "newer_noncurrent_versions", null)
-        noncurrent_days           = lookup(noncurrent_version_expiration.value, "noncurrent_days", null)
+        content {
+          newer_noncurrent_versions = try(noncurrent_version_expiration.value.newer_noncurrent_versions, null)
+          noncurrent_days           = try(noncurrent_version_expiration.value.noncurrent_days, null)
+        }
       }
-    }
 
-    // Several blocks - noncurrent_version_transition
-    dynamic "noncurrent_version_transition" {
-      for_each = try([var.lifecycle_rule[count.index]["noncurrent_version_transition"]], {})
+      dynamic "noncurrent_version_transition" {
+        for_each = try(flatten([rule.value.noncurrent_version_transition]), [])
 
-      content {
-        newer_noncurrent_versions = lookup(noncurrent_version_transition.value, "newer_noncurrent_versions", null)
-        noncurrent_days           = lookup(noncurrent_version_transition.value, "noncurrent_days", null)
-        storage_class             = noncurrent_version_transition.value.storage_class
+        content {
+          newer_noncurrent_versions = try(noncurrent_version_transition.value.newer_noncurrent_versions, null)
+          noncurrent_days           = try(noncurrent_version_transition.value.noncurrent_days, null)
+          storage_class             = noncurrent_version_transition.value.storage_class
+        }
       }
-    }
 
-    dynamic "transition" {
-      for_each = try([var.lifecycle_rule[count.index]["transition"]], {})
+      dynamic "transition" {
+        for_each = try(flatten([rule.value.transition]), [])
 
-      content {
-        date          = lookup(transition.value, "date", null)
-        days          = lookup(transition.value, "days", null)
-        storage_class = transition.value.storage_class
+        content {
+          date          = try(transition.value.date, null)
+          days          = try(transition.value.days, null)
+          storage_class = transition.value.storage_class
+        }
       }
     }
   }
@@ -143,8 +177,15 @@ resource "aws_s3_bucket_lifecycle_configuration" "default" {
 resource "aws_s3_bucket_logging" "default" {
   for_each      = local.logging
   bucket        = aws_s3_bucket.default.id
-  target_bucket = var.logging.target_bucket == null ? var.name : var.logging.target_bucket
+  target_bucket = var.logging.target_bucket
   target_prefix = var.logging.target_prefix
+
+  lifecycle {
+    precondition {
+      condition     = var.logging.target_bucket != var.name || var.object_lock_mode == null
+      error_message = "You're trying to enable server access logging and object locking on the same bucket! Object lock will prevent server access logs from written to the bucket. Either log to a different bucket or remove the object lock configuration."
+    }
+  }
 }
 
 resource "aws_s3_bucket_object_lock_configuration" "default" {
@@ -156,6 +197,13 @@ resource "aws_s3_bucket_object_lock_configuration" "default" {
       mode  = var.object_lock_mode
       years = var.object_lock_years
       days  = var.object_lock_days
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.object_lock_mode == null || length(local.logging_permissions_source_buckets) == 0
+      error_message = "You're trying to allow (other buckets) logging to this bucket and enable object locking on the same bucket! Object lock will prevent server access logs from written to the bucket. Either remove the logging source buckets configuration or remove the object lock configuration."
     }
   }
 }
@@ -193,7 +241,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "default" {
 
 resource "aws_s3_bucket_policy" "default" {
   bucket = aws_s3_bucket.default.id
-  policy = data.aws_iam_policy_document.bucket_policy.json
+  policy = data.aws_iam_policy_document.combined.json
 }
 
 resource "aws_s3_bucket_public_access_block" "default" {
