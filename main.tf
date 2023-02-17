@@ -260,3 +260,9 @@ resource "aws_s3_bucket_versioning" "default" {
     status = var.versioning ? "Enabled" : "Suspended"
   }
 }
+
+resource "aws_s3_bucket_notification" "default" {
+  bucket = aws_s3_bucket.default.id
+
+  eventbridge = true
+}
